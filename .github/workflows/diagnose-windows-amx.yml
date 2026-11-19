@@ -14,6 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         fix: [false, true]
+        sanitize: [false, true]
     steps:
       - uses: actions/checkout@v6
       - shell: pwsh
@@ -54,14 +55,23 @@ jobs:
       - name: Build source release function and common allocator with ASAN
         shell: pwsh
         run: |
-          cmake -S . -B build -G 'Ninja Multi-Config' '-DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake' -DGGML_CPU=OFF -DGGML_BLAS=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_BUILD_SERVER=OFF '-DCMAKE_C_FLAGS=-fsanitize=address -g' '-DCMAKE_CXX_FLAGS=-fsanitize=address -g' '-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address' '-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address'
+          $flags = @()
+          if ('${{ matrix.sanitize }}' -eq 'true') {
+            $flags += '-DCMAKE_C_FLAGS=-fsanitize=address -g'
+            $flags += '-DCMAKE_CXX_FLAGS=-fsanitize=address -g'
+            $flags += '-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address'
+            $flags += '-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address'
+          }
+          cmake -S . -B build -G 'Ninja Multi-Config' '-DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake' -DGGML_CPU=OFF -DGGML_BLAS=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_BUILD_SERVER=OFF @flags
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build build --config RelWithDebInfo --target amx-buffer-probe -j 4
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $resource = (& clang --print-resource-dir).Trim()
-          $runtime = Get-ChildItem $resource -Recurse -Filter 'clang_rt.asan*.dll'
-          if (!$runtime) { throw "ASAN runtime DLL missing under $resource" }
-          $runtime | ForEach-Object { Copy-Item $_.FullName build/bin/RelWithDebInfo/ -Force }
+          if ('${{ matrix.sanitize }}' -eq 'true') {
+            $resource = (& clang --print-resource-dir).Trim()
+            $runtime = Get-ChildItem $resource -Recurse -Filter 'clang_rt.asan*.dll'
+            if (!$runtime) { throw "ASAN runtime DLL missing under $resource" }
+            $runtime | ForEach-Object { Copy-Item $_.FullName build/bin/RelWithDebInfo/ -Force }
+          }
       - name: Exercise exactly one AMX allocation and release
         shell: pwsh
         run: |
@@ -72,11 +82,16 @@ jobs:
           & ./build/bin/RelWithDebInfo/amx-buffer-probe.exe *> diagnostics/amx.txt
           $result = $LASTEXITCODE
           Get-Content diagnostics/amx.txt
-          "fix=${{ matrix.fix }} exit=$result" | Tee-Object diagnostics/result.txt
+          "fix=${{ matrix.fix }} asan=${{ matrix.sanitize }} exit=$result" | Tee-Object diagnostics/result.txt
           if ('${{ matrix.fix }}' -eq 'true' -and $result -ne 0) { exit 1 }
+          if ('${{ matrix.fix }}' -eq 'false') {
+            if ('${{ matrix.sanitize }}' -eq 'true') {
+              if (!(Select-String -Path diagnostics/amx.txt -Pattern 'attempting free on address which was not malloc')) { exit 1 }
+            } elseif ($result -ne -1073740940) { exit 1 }
+          }
           exit 0
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: amx-release-fix-${{ matrix.fix }}
+          name: amx-release-fix-${{ matrix.fix }}-asan-${{ matrix.sanitize }}
           path: diagnostics
