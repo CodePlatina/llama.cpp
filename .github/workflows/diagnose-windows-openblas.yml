@@ -27,6 +27,9 @@ jobs:
           $version = (Get-Content "$vcdir/VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt" -Raw).Trim()
           & "$vcdir/VC/Tools/MSVC/$version/bin/Hostx64/x64/lib.exe" /machine:x64 "/def:$env:RUNNER_TEMP/openblas/lib/libopenblas.def" "/out:$env:RUNNER_TEMP/openblas/lib/openblas.lib" /name:openblas.dll
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Install Ninja
+        shell: pwsh
+        run: choco install ninja --yes --no-progress
       - name: Mark model destruction stages
         shell: python
         run: |
@@ -55,7 +58,7 @@ jobs:
             $flags += '-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address'
             $flags += '-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address'
           }
-          cmake -S . -B build -G 'Ninja Multi-Config' -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake -DGGML_NATIVE=OFF -DGGML_RPC=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS "-DBLAS_INCLUDE_DIRS=$env:RUNNER_TEMP/openblas/include" "-DBLAS_LIBRARIES=$env:RUNNER_TEMP/openblas/lib/openblas.lib" -DLLAMA_BUILD_UI=OFF -DLLAMA_BUILD_SERVER=OFF @flags
+          cmake -S . -B build -G 'Ninja Multi-Config' "-DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake" -DGGML_NATIVE=OFF -DGGML_RPC=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS "-DBLAS_INCLUDE_DIRS=$env:RUNNER_TEMP/openblas/include" "-DBLAS_LIBRARIES=$env:RUNNER_TEMP/openblas/lib/openblas.lib" -DLLAMA_BUILD_UI=OFF -DLLAMA_BUILD_SERVER=OFF @flags
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build build --config RelWithDebInfo --target test-thread-safety -j 4
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
