@@ -1,7 +1,5 @@
 name: Diagnose Windows OpenBLAS shutdown
 on:
-  push:
-    branches: [diag/openblas-shutdown-20261119]
   workflow_dispatch:
 permissions:
   contents: read

@@ -1,0 +1,83 @@
+name: Isolate Windows AMX buffer release
+on:
+  push:
+    branches: [diag/openblas-shutdown-20261119]
+    paths: [.github/workflows/diagnose-windows-amx.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  isolate:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        fix: [false, true]
+    steps:
+      - uses: actions/checkout@v6
+      - shell: pwsh
+        run: choco install ninja --yes --no-progress
+      - name: Create direct AMX allocation probe
+        shell: python
+        run: |
+          from pathlib import Path
+          if '${{ matrix.fix }}' == 'true':
+              path = Path('ggml/src/ggml-cpu/amx/amx.cpp')
+              text = path.read_text()
+              old = '    free(buffer->context);'
+              assert text.count(old) == 1
+              path.write_text(text.replace(old, '    ggml_aligned_free(buffer->context, buffer->size);'))
+          Path('amx-buffer-probe.cpp').write_text(r'''
+          #include "ggml-backend.h"
+          #include <cstdio>
+          #include <cstring>
+          int main(int argc, char ** argv) {
+              std::setvbuf(stdout, nullptr, _IONBF, 0);
+              if (argc != 2) return 2;
+              auto reg = ggml_backend_load(argv[1]);
+              if (!reg) return 3;
+              auto get_extra = reinterpret_cast<ggml_backend_dev_get_extra_bufts_t>(
+                  ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts"));
+              if (!get_extra) return 4;
+              auto types = get_extra(ggml_backend_reg_dev_get(reg, 0));
+              for (size_t i = 0; types[i]; ++i) {
+                  if (std::strcmp(ggml_backend_buft_name(types[i]), "AMX") != 0) continue;
+                  auto buffer = ggml_backend_buft_alloc_buffer(types[i], 4096);
+                  if (!buffer) return 5;
+                  std::printf("Allocated AMX buffer at %p, now freeing it\n", ggml_backend_buffer_get_base(buffer));
+                  ggml_backend_buffer_free(buffer);
+                  std::puts("AMX buffer release returned successfully");
+                  return 0;
+              }
+              std::puts("AMX buffer type was not registered");
+              return 6;
+          }
+          ''')
+          with Path('CMakeLists.txt').open('a') as f:
+              f.write('\nadd_executable(amx-buffer-probe amx-buffer-probe.cpp)\ntarget_link_libraries(amx-buffer-probe PRIVATE ggml)\n')
+      - name: Build only the allocation probe and AMX backend with ASAN
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G 'Ninja Multi-Config' '-DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake' -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=OFF -DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON -DGGML_AMX_INT8=ON -DGGML_AMX_TILE=ON -DGGML_OPENMP=OFF -DGGML_BLAS=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_BUILD_SERVER=OFF '-DCMAKE_C_FLAGS=-fsanitize=address -g' '-DCMAKE_CXX_FLAGS=-fsanitize=address -g' '-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address' '-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address'
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build --config RelWithDebInfo --target amx-buffer-probe ggml-cpu -j 4
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Exercise exactly one AMX allocation and release
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $env:PATH = "C:/Program Files/LLVM/bin;$env:PATH"
+          $env:ASAN_OPTIONS = 'halt_on_error=1:symbolize=1'
+          New-Item -ItemType Directory diagnostics
+          & ./build/bin/RelWithDebInfo/amx-buffer-probe.exe ./build/bin/RelWithDebInfo/ggml-cpu.dll *> diagnostics/amx.txt
+          $result = $LASTEXITCODE
+          Get-Content diagnostics/amx.txt
+          "fix=${{ matrix.fix }} exit=$result" | Tee-Object diagnostics/result.txt
+          if ('${{ matrix.fix }}' -eq 'true' -and $result -ne 0) { exit 1 }
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: amx-release-fix-${{ matrix.fix }}
+          path: diagnostics
