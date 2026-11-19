@@ -1,0 +1,91 @@
+name: Diagnose Windows OpenBLAS shutdown
+on:
+  push:
+    branches: [diag/openblas-shutdown-20261119]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitize: [false, true]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Prepare OpenBLAS 0.3.23
+        shell: pwsh
+        run: |
+          curl.exe -fL https://github.com/OpenMathLib/OpenBLAS/releases/download/v0.3.23/OpenBLAS-0.3.23-x64.zip -o "$env:RUNNER_TEMP/openblas.zip"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory "$env:RUNNER_TEMP/openblas"
+          tar.exe -xf "$env:RUNNER_TEMP/openblas.zip" -C "$env:RUNNER_TEMP/openblas"
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $vcdir = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $version = (Get-Content "$vcdir/VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt" -Raw).Trim()
+          & "$vcdir/VC/Tools/MSVC/$version/bin/Hostx64/x64/lib.exe" /machine:x64 "/def:$env:RUNNER_TEMP/openblas/lib/libopenblas.def" "/out:$env:RUNNER_TEMP/openblas/lib/openblas.lib" /name:openblas.dll
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Mark model destruction stages
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('tests/test-thread-safety.cpp')
+          text = p.read_text()
+          marker = '    LOG_INF("All threads finished without errors.\\n");'
+          assert text.count(marker) == 1
+          text = text.replace(marker, marker + '''
+              fprintf(stderr, "DIAG: starting model destruction\\n");
+              for (size_t i = 0; i < models.size(); ++i) {
+                  fprintf(stderr, "DIAG: freeing model %zu\\n", i);
+                  models[i].reset();
+                  fprintf(stderr, "DIAG: freed model %zu\\n", i);
+              }
+              fprintf(stderr, "DIAG: model destruction finished, returning from main\\n");
+          ''')
+          p.write_text(text)
+      - name: Build thread safety test
+        shell: pwsh
+        run: |
+          $flags = @()
+          if ('${{ matrix.sanitize }}' -eq 'true') {
+            $flags += '-DCMAKE_C_FLAGS=-fsanitize=address -g'
+            $flags += '-DCMAKE_CXX_FLAGS=-fsanitize=address -g'
+            $flags += '-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address'
+            $flags += '-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address'
+          }
+          cmake -S . -B build -G 'Ninja Multi-Config' -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake -DGGML_NATIVE=OFF -DGGML_RPC=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS "-DBLAS_INCLUDE_DIRS=$env:RUNNER_TEMP/openblas/include" "-DBLAS_LIBRARIES=$env:RUNNER_TEMP/openblas/lib/openblas.lib" -DLLAMA_BUILD_UI=OFF -DLLAMA_BUILD_SERVER=OFF @flags
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build --config RelWithDebInfo --target test-thread-safety -j 4
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Copy-Item "$env:RUNNER_TEMP/openblas/bin/libopenblas.dll" build/bin/RelWithDebInfo/openblas.dll
+      - name: Run controlled shutdown experiments
+        shell: pwsh
+        run: |
+          ctest --test-dir build -C RelWithDebInfo -R '^test-download-model$' --output-on-failure
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $PSNativeCommandUseErrorActionPreference = $false
+          New-Item -ItemType Directory diagnostics
+          $env:ASAN_OPTIONS = 'halt_on_error=1:symbolize=1'
+          $env:PATH = "C:/Program Files/LLVM/bin;$env:PATH"
+          foreach ($mode in @('original', 'one-blas-thread', 'cpu-only')) {
+            Remove-Item Env:OPENBLAS_NUM_THREADS -ErrorAction SilentlyContinue
+            $disabled = 'build/bin/RelWithDebInfo/ggml-blas.disabled'
+            $enabled = 'build/bin/RelWithDebInfo/ggml-blas.dll'
+            if (Test-Path $disabled) { Move-Item $disabled $enabled }
+            if ($mode -eq 'one-blas-thread') { $env:OPENBLAS_NUM_THREADS = '1' }
+            if ($mode -eq 'cpu-only') { Move-Item $enabled $disabled }
+            for ($attempt = 1; $attempt -le 5; $attempt++) {
+              $log = "diagnostics/$mode-$attempt.txt"
+              & ./build/bin/RelWithDebInfo/test-thread-safety.exe -m build/stories15M-q4_0.gguf -ngl 99 -p 'The meaning of life is' -n 128 -c 256 -ub 32 -np 4 -t 2 *> $log
+              $result = $LASTEXITCODE
+              "mode=$mode attempt=$attempt exit=$result" | Tee-Object -FilePath diagnostics/results.txt -Append
+            }
+          }
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: openblas-shutdown-asan-${{ matrix.sanitize }}
+          path: diagnostics
