@@ -63,6 +63,10 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build build --config RelWithDebInfo --target amx-buffer-probe ggml-cpu -j 4
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $resource = (& clang --print-resource-dir).Trim()
+          $runtime = Get-ChildItem $resource -Recurse -Filter 'clang_rt.asan*.dll'
+          if (!$runtime) { throw "ASAN runtime DLL missing under $resource" }
+          $runtime | ForEach-Object { Copy-Item $_.FullName build/bin/RelWithDebInfo/ -Force }
       - name: Exercise exactly one AMX allocation and release
         shell: pwsh
         run: |

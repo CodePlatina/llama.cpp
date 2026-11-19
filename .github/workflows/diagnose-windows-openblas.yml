@@ -61,6 +61,12 @@ jobs:
           cmake --build build --config RelWithDebInfo --target test-thread-safety -j 4
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           Copy-Item "$env:RUNNER_TEMP/openblas/bin/libopenblas.dll" build/bin/RelWithDebInfo/openblas.dll
+          if ('${{ matrix.sanitize }}' -eq 'true') {
+            $resource = (& clang --print-resource-dir).Trim()
+            $runtime = Get-ChildItem $resource -Recurse -Filter 'clang_rt.asan*.dll'
+            if (!$runtime) { throw "ASAN runtime DLL missing under $resource" }
+            $runtime | ForEach-Object { Copy-Item $_.FullName build/bin/RelWithDebInfo/ -Force }
+          }
       - name: Run controlled shutdown experiments
         shell: pwsh
         run: |
